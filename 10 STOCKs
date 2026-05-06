@@ -1,0 +1,402 @@
+// Global Top 10 Live Widget - 장 시작/마감 업데이트 및 순위 변동 표기 패치
+const version = "11.0-GlobalTop10Live"
+
+// [1] 데이터 저장소 설정 🛠️
+const fm = FileManager.iCloud()
+const dir = fm.documentsDirectory()
+const filePath = fm.joinPath(dir, "GlobalTop10LiveData.json")
+
+async function loadData() {
+  let data = null
+  if (fm.fileExists(filePath)) {
+    if (!fm.isFileDownloaded(filePath)) await fm.downloadFileFromiCloud(filePath)
+    try { data = JSON.parse(fm.readString(filePath)) } catch(e) {}
+  }
+  
+  if (!data || !data.shares) {
+    data = {
+      shares: {}, 
+      settings: {
+        titleFont: "AppleSDGothicNeo-Bold", titleSize: 13,
+        itemFont: "AppleSDGothicNeo-Regular", itemSize: 11,
+        totalLabel: "💰 내 자산 총액:",
+        itemSpacing: 2
+      },
+      prevRanks: {},      // 이전 순위 기록용
+      currentRanks: {},   // 현재 순위 기록용
+      lastUpdatePeriod: "" // OPEN or CLOSE 상태 기록
+    }
+  }
+  return data
+}
+
+function saveData(data) {
+  fm.writeString(filePath, JSON.stringify(data, null, 2))
+}
+
+// [2] 실시간 랭킹 엔진 및 시총 계산
+const topCandidates = [
+  { ticker: "AAPL", name: "애플", sharesOut: 15.34 },
+  { ticker: "MSFT", name: "마이크로소프트", sharesOut: 7.43 },
+  { ticker: "NVDA", name: "엔비디아", sharesOut: 24.50 },
+  { ticker: "GOOGL", name: "알파벳", sharesOut: 12.33 },
+  { ticker: "AMZN", name: "아마존", sharesOut: 10.40 },
+  { ticker: "META", name: "메타", sharesOut: 2.53 },
+  { ticker: "TSM", name: "TSMC", sharesOut: 5.18 },
+  { ticker: "BRK-B", name: "버크셔", sharesOut: 3.20 },
+  { ticker: "LLY", name: "일라이 릴리", sharesOut: 0.95 },
+  { ticker: "AVGO", name: "브로드컴", sharesOut: 4.65 },
+  { ticker: "TSLA", name: "테슬라", sharesOut: 3.19 },
+  { ticker: "WMT", name: "월마트", sharesOut: 8.02 },
+  { ticker: "V", name: "비자", sharesOut: 1.95 },
+  { ticker: "JPM", name: "JP모건", sharesOut: 2.86 },
+  { ticker: "XOM", name: "엑슨모빌", sharesOut: 3.96 },
+  { ticker: "UNH", name: "유나이티드헬스", sharesOut: 0.92 },
+  { ticker: "MA", name: "마스터카드", sharesOut: 0.92 },
+  { ticker: "PG", name: "P&G", sharesOut: 2.36 },
+  { ticker: "JNJ", name: "존슨앤존슨", sharesOut: 2.40 },
+  { ticker: "HD", name: "홈디포", sharesOut: 0.99 }
+];
+
+const reqHeaders = {
+  "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
+};
+
+async function fetchPriceSafe(ticker) {
+  try {
+    let req = new Request(`https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}`);
+    req.headers = reqHeaders;
+    let res = await req.loadJSON();
+    return res.chart.result[0].meta.regularMarketPrice;
+  } catch (e) { return null; }
+}
+
+async function fetchLiveRankings() {
+  try {
+    let fetchPromises = topCandidates.map(async (company) => {
+      let price = await fetchPriceSafe(company.ticker);
+      return { ...company, priceUSD: price || 0, marketCap: (price || 0) * company.sharesOut };
+    });
+    let results = await Promise.all(fetchPromises);
+    results = results.filter(r => r.marketCap > 0).sort((a, b) => b.marketCap - a.marketCap);
+    return results.slice(0, 10).map((r, i) => ({ ...r, rank: i + 1 }));
+  } catch (e) { return []; }
+}
+
+async function fetchExchangeRate() {
+  let rate = await fetchPriceSafe("KRW=X");
+  return rate || 1350;
+}
+
+function formatUSD(num) { return "$" + num.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2}); }
+function formatKRW(num) { return "₩" + Math.round(num).toLocaleString('ko-KR'); }
+function formatMarketCapKRW(mcapBillionUSD, exRate) {
+  let jo = (mcapBillionUSD * exRate) / 1000;
+  return jo >= 1 ? Math.round(jo).toLocaleString('ko-KR') + "조" : Math.round(jo * 10000).toLocaleString('ko-KR') + "억";
+}
+
+
+// [3] 앱 내부 UI (보유량 입력 및 여백 설정) 📱
+async function buildAppUI(data, liveTop10) {
+  let table = new UITable()
+  table.showSeparators = true
+
+  async function promptShares(ticker, name, currentShares) {
+    let a = new Alert()
+    a.title = `${name} 보유량 입력`
+    a.message = "현재 보유 중인 주식 수를 입력하세요. (없으면 0 입력)"
+    a.addTextField("주식 수", currentShares ? currentShares.toString() : "")
+    
+    a.addAction("저장")
+    a.addCancelAction("취소")
+
+    if (await a.presentAlert() === -1) return null
+
+    let shares = parseFloat(a.textFieldValue(0).trim())
+    if (isNaN(shares) || shares < 0) shares = 0;
+    
+    return shares
+  }
+
+  async function promptInput(title, placeholder, defaultVal) {
+    let a = new Alert()
+    a.title = title
+    a.addTextField(placeholder, defaultVal.toString())
+    
+    a.addAction("저장")
+    a.addCancelAction("취소")
+    if (await a.presentAlert() !== -1) {
+      let val = parseInt(a.textFieldValue(0).trim())
+      return isNaN(val) ? defaultVal : val
+    }
+    return null
+  }
+
+  function render() {
+    table.removeAllRows()
+
+    let h = new UITableRow(); h.isHeader = true
+    h.addText("🌍 [실시간] 글로벌 시총 Top 10 관리")
+    table.addRow(h)
+
+    let sRow = new UITableRow()
+    let sBtn = sRow.addButton(`⚙️ 위젯 상하 간격 설정 (현재: ${data.settings.itemSpacing}px)`)
+    sBtn.onTap = () => {
+      (async () => {
+        let val = await promptInput("상하 간격 설정", "간격 숫자", data.settings.itemSpacing)
+        if (val !== null) { data.settings.itemSpacing = val; saveData(data); render() }
+      })();
+    }
+    table.addRow(sRow)
+
+    if (liveTop10.length === 0) {
+        let errRow = new UITableRow()
+        errRow.addText("데이터를 불러오는 중 문제가 발생했습니다.")
+        table.addRow(errRow)
+    } else {
+        liveTop10.forEach((item) => {
+          let r = new UITableRow()
+          let myShares = data.shares[item.ticker] || 0;
+          
+          let rankStr = item.rank < 10 ? `0${item.rank}` : `${item.rank}`
+          let mcapStr = formatMarketCapKRW(item.marketCap, 1380)
+          
+          let titleStr = `${rankStr}. ${item.name} (${item.ticker}) [${mcapStr}]`
+          if (myShares > 0) titleStr += `  👉 [내 보유: ${myShares}주]`
+          
+          let txtBtn = r.addButton(titleStr)
+          txtBtn.widthWeight = 85; txtBtn.leftAligned()
+          if (myShares > 0) txtBtn.titleColor = new Color("#FF9500")
+
+          let tapAction = () => {
+            (async () => {
+              let newShares = await promptShares(item.ticker, item.name, myShares)
+              if (newShares !== null) { 
+                  data.shares[item.ticker] = newShares; 
+                  saveData(data); 
+                  render(); 
+              }
+            })();
+          };
+
+          txtBtn.onTap = tapAction;
+          let editBtn = r.addButton("✏️ 입력")
+          editBtn.widthWeight = 15; editBtn.rightAligned()
+          editBtn.onTap = tapAction;
+
+          table.addRow(r)
+        })
+    }
+
+    let pRow = new UITableRow()
+    let pBtn = pRow.addButton("🚀 위젯 미리보기 실행")
+    pBtn.onTap = () => {
+      (async () => {
+        let w = await createWidget(data, liveTop10)
+        await w.presentLarge() 
+      })()
+    }
+    table.addRow(pRow)
+    table.reload()
+  }
+
+  render()
+  return table.present()
+}
+
+
+// [4] 위젯 그리기 로직 🎨
+async function createWidget(data, liveTop10) {
+  let widget = new ListWidget()
+  const BG_COLOR = Color.dynamic(new Color("#ffffff"), new Color("#1C1C1E"))
+  const TEXT_COLOR = Color.dynamic(new Color("#1C1C1E"), new Color("#FFFFFF"))
+  const SUBTEXT_COLOR = Color.dynamic(new Color("#6E6E73"), new Color("#8E8E93"))
+  const ACCENT_COLOR = new Color("#007AFF")
+  const HIGHLIGHT_COLOR = new Color("#FF9500")
+  
+  // 한국 주식 시장 개장/마감 시간이 아닌, 미국 시장 스케줄에 맞춰 KST로 변환
+  // 장 시작: 한국시간 밤 11시 30분 경 / 장 마감: 아침 6시 경
+  let now = new Date()
+  let nextUpdate = new Date()
+  let currentHour = now.getHours()
+  
+  // 💡 스마트 업데이트 스케줄링 (하루 2회)
+  if (currentHour < 6) { nextUpdate.setHours(6, 10, 0, 0); } // 아침 6시 10분 마감 반영
+  else if (currentHour < 23) { nextUpdate.setHours(23, 10, 0, 0); } // 밤 11시 10분 개장 반영
+  else { nextUpdate.setDate(nextUpdate.getDate() + 1); nextUpdate.setHours(6, 10, 0, 0); }
+  
+  widget.refreshAfterDate = nextUpdate
+
+  // 💡 데이터 저장 (이전 순위 비교를 위한 로직)
+  if (liveTop10.length > 0) {
+      let currentPeriod = (currentHour >= 6 && currentHour < 23) ? "CLOSE" : "OPEN";
+      let currentRanksMap = {};
+      liveTop10.forEach(i => currentRanksMap[i.ticker] = i.rank);
+
+      if (data.lastUpdatePeriod !== currentPeriod) {
+          // 장이 새로 열리거나 마감되었을 때만 이전 순위 갱신
+          data.prevRanks = data.currentRanks || currentRanksMap;
+          data.lastUpdatePeriod = currentPeriod;
+      }
+      data.currentRanks = currentRanksMap;
+      saveData(data);
+  }
+
+  const SETTINGS = data.settings
+  widget.backgroundColor = BG_COLOR
+  widget.setPadding(12, 14, 12, 14)
+
+  // 상단 헤더
+  let header = widget.addStack()
+  header.centerAlignContent()
+  let title = header.addText("🌍 실시간 시총 Top 10")
+  title.font = new Font(SETTINGS.titleFont, SETTINGS.titleSize)
+  title.textColor = ACCENT_COLOR
+  header.addSpacer()
+  
+  let exchangeRate = await fetchExchangeRate();
+  
+  // 💡 마지막 업데이트 시간 표시
+  let df = new DateFormatter()
+  df.dateFormat = "HH:mm"
+  let timeStr = df.string(now)
+  
+  let rateText = header.addText(`업데이트: ${timeStr} | 환율: ${formatKRW(exchangeRate)}`)
+  rateText.font = new Font(SETTINGS.titleFont, SETTINGS.itemSize - 1)
+  rateText.textColor = SUBTEXT_COLOR
+
+  widget.addSpacer(5)
+  let line = widget.addStack(); line.size = new Size(0, 1); line.backgroundColor = SUBTEXT_COLOR; line.setPadding(0,0,0,0); widget.addSpacer(6)
+
+  let myTotalAssetKRW = 0;
+
+  liveTop10.forEach((item, index) => {
+    let myShares = data.shares[item.ticker] || 0;
+    let priceKRW = item.priceUSD * exchangeRate;
+    if (myShares > 0) myTotalAssetKRW += (priceKRW * myShares);
+
+    let row = widget.addStack()
+    row.centerAlignContent()
+
+    // 1. 번호 박스
+    let c1 = row.addStack()
+    c1.size = new Size(16, 0)
+    let rankStr = item.rank < 10 ? `0${item.rank}` : `${item.rank}`
+    let rankTxt = c1.addText(rankStr)
+    rankTxt.font = new Font(SETTINGS.titleFont, SETTINGS.itemSize)
+    rankTxt.textColor = SUBTEXT_COLOR
+
+    // 💡 1-1. 순위 변동 박스 (▲1 / ▼2)
+    let cDiff = row.addStack()
+    cDiff.size = new Size(18, 0)
+    
+    let prevRank = data.prevRanks ? data.prevRanks[item.ticker] : undefined;
+    let diffStr = " ";
+    let diffColor = SUBTEXT_COLOR;
+
+    if (prevRank && prevRank !== item.rank) {
+        let diff = prevRank - item.rank; // 양수면 상승, 음수면 하락
+        if (diff > 0) {
+            diffStr = `▲${diff}`;
+            diffColor = new Color("#FF3B30"); // 빨간색 (상승)
+        } else if (diff < 0) {
+            diffStr = `▼${Math.abs(diff)}`;
+            diffColor = new Color("#007AFF"); // 파란색 (하락)
+        }
+    }
+    let diffTxt = cDiff.addText(diffStr)
+    diffTxt.font = new Font(SETTINGS.titleFont, SETTINGS.itemSize - 2)
+    diffTxt.textColor = diffColor
+    diffTxt.lineLimit = 1
+
+    // 2. 종목명 박스
+    let c2 = row.addStack()
+    c2.size = new Size(52, 0)
+    let nTxt = c2.addText(item.name)
+    nTxt.font = new Font(SETTINGS.titleFont, SETTINGS.itemSize)
+    nTxt.textColor = TEXT_COLOR
+    nTxt.lineLimit = 1
+    nTxt.minimumScaleFactor = 0.7
+
+    // 3. 티커 박스 (AAPL)
+    let c3 = row.addStack()
+    c3.size = new Size(36, 0)
+    let tTxt = c3.addText(item.ticker)
+    tTxt.font = new Font(SETTINGS.itemFont, SETTINGS.itemSize - 1)
+    tTxt.textColor = SUBTEXT_COLOR
+    tTxt.lineLimit = 1
+    tTxt.minimumScaleFactor = 0.6
+
+    // 4. 시가총액 박스
+    let cMcap = row.addStack()
+    cMcap.size = new Size(42, 0)
+    let mTxt = cMcap.addText(formatMarketCapKRW(item.marketCap, exchangeRate))
+    mTxt.font = new Font(SETTINGS.itemFont, SETTINGS.itemSize - 2)
+    mTxt.textColor = ACCENT_COLOR 
+    mTxt.lineLimit = 1
+    mTxt.minimumScaleFactor = 0.5
+
+    // 5. 내 보유 주식 수 박스
+    let c4 = row.addStack()
+    if (myShares > 0) {
+        let sTxt = c4.addText(`[${myShares}주]`)
+        sTxt.font = new Font(SETTINGS.titleFont, SETTINGS.itemSize - 1)
+        sTxt.textColor = HIGHLIGHT_COLOR
+        sTxt.lineLimit = 1
+        sTxt.minimumScaleFactor = 0.6
+    }
+
+    row.addSpacer() 
+
+    // 6. 가격 박스
+    let c5 = row.addStack()
+    c5.layoutVertically()
+    c5.size = new Size(65, 0) 
+    
+    let pTxt1 = c5.addText(formatUSD(item.priceUSD))
+    pTxt1.font = new Font(SETTINGS.titleFont, SETTINGS.itemSize)
+    pTxt1.textColor = TEXT_COLOR
+    pTxt1.rightAlignText()
+    pTxt1.lineLimit = 1
+    pTxt1.minimumScaleFactor = 0.7
+
+    let pTxt2 = c5.addText(formatKRW(priceKRW))
+    pTxt2.font = new Font(SETTINGS.itemFont, SETTINGS.itemSize - 2)
+    pTxt2.textColor = SUBTEXT_COLOR
+    pTxt2.rightAlignText()
+    pTxt2.lineLimit = 1
+
+    if (index < liveTop10.length - 1) widget.addSpacer(SETTINGS.itemSpacing)
+  });
+
+  widget.addSpacer(4)
+  let line2 = widget.addStack(); line2.size = new Size(0, 1); line2.backgroundColor = SUBTEXT_COLOR; line2.setPadding(0,0,0,0); widget.addSpacer(6)
+  
+  let totalRow = widget.addStack()
+  totalRow.centerAlignContent()
+  
+  let tLabel = totalRow.addText(SETTINGS.totalLabel)
+  tLabel.font = new Font(SETTINGS.titleFont, SETTINGS.itemSize + 1)
+  tLabel.textColor = TEXT_COLOR
+  
+  totalRow.addSpacer() 
+  
+  let tKrw = totalRow.addText(formatKRW(myTotalAssetKRW))
+  tKrw.font = new Font(SETTINGS.titleFont, SETTINGS.itemSize + 2)
+  tKrw.textColor = myTotalAssetKRW > 0 ? HIGHLIGHT_COLOR : SUBTEXT_COLOR
+  
+  return widget
+}
+
+// [5] 실행 처리부 🚀
+let appData = await loadData()
+let liveTop10 = await fetchLiveRankings()
+
+if (config.runsInWidget) {
+  let widget = await createWidget(appData, liveTop10)
+  Script.setWidget(widget)
+} else {
+  await buildAppUI(appData, liveTop10)
+}
+
+Script.complete()
